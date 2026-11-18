@@ -1,0 +1,1 @@
+# yara_rules_scripting_rules

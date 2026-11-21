@@ -1,58 +1,60 @@
-# Linux IR: YARA hunting + incident collector
+# Linux Blue Team: Independent YARA Rule Pack
 
-## Files
-- `linux_hunt.yar`: five independent heuristic YARA rules (LKM, CR0, trampoline, LD_PRELOAD, eBPF).
-- `ir-collect.sh`: one-shot collector; no sleep or polling; creates a private case directory only on a match.
+**Authorized defensive analysis only.** All rules are heuristics, not malware verdicts. No automatic deletion, killing, or chmod. The existing `ir-collect.sh` is provided unchanged for optional manual evidence collection.
 
-## Install (Ubuntu/Debian)
+## Rules
+
+| File | Target | Notes |
+|---|---|---|
+| `01_lkm_rootkits.yar` | on-disk ELF relocatable kernel modules | hooking, stealth, x86-64 CR0, trampoline |
+| `02_ebpf.yar` | eBPF ELF objects | section strings plus multiple contextual indicators |
+| `03_ld_preload.yar` | ELF shared objects / preload config | loader injection and hiding; generic path rule is noisy |
+| `04_beacons_c2.yar` | ELF/script content | network + execution + timing, download-and-execute; **does not extract or confirm C2 IPs** |
+| `05_persistence_configs.yar` | PAM, SSH, systemd, APT text | inspired by Acme Anvil competition incidents |
+| `06_other_malware.yar` | other suspicious content | shellcode, SUID shell references, cron |
+| `07_encoded_indicators.yar` | binary/text | XOR, Base64, UTF-16LE wide strings; multiple hits required |
+
+## Installation (Debian/Ubuntu)
+
 ```bash
-sudo apt install yara auditd python3 iproute2
-sudo mkdir -p /etc/yara
-sudo install -m 600 linux_hunt.yar /etc/yara/linux_hunt.yar
-sudo install -m 700 ir-collect.sh /usr/local/sbin/ir-collect.sh
+sudo apt update
+sudo apt install yara auditd python3 binutils kmod
 ```
 
-## Usage
+Fedora/RHEL: `sudo dnf install yara audit python3 binutils kmod` (YARA availability may depend on repositories). Arch: `sudo pacman -S yara audit python binutils kmod`. Validate package names for your distro.
+
+## Test each rule separately
+
 ```bash
-ir-collect.sh --help
-yara --help
-yara --version
-yara -s /etc/yara/linux_hunt.yar /path/to/suspicious.ko
-sudo ir-collect.sh --scan /path/to/suspicious.ko
-sudo ir-collect.sh --scan /path/to/suspicious.so --pid 1234 --audit-serial 567
-sudo ir-collect.sh --process 1234
-# If your installation provides a 'yara64' binary:
-sudo YARA_BIN=yara64 ir-collect.sh --scan /path/to/suspicious.ko
+yara -s rules/05_persistence_configs.yar tests/pam-hook.txt
+yara -s rules/05_persistence_configs.yar tests/ssh-weak.conf
+yara -s rules/04_beacons_c2.yar tests/beacon-demo.sh
+yara -s rules/06_other_malware.yar tests/cron-demo.txt
+for rule in rules/*.yar; do echo "Checking $rule"; yarac "$rule" /tmp/blue-team-test.yarc || break; done
 ```
 
-`yara64` is a name used by some builds/distributions, not a universal Linux executable. Check `command -v yara64`. A PID scan may be blocked by kernel permissions and cannot be assumed to scan kernel memory.
+`yarac` compiles rules; remove `/tmp/blue-team-test.yarc` afterward. Scan **one rule file at a time** to tune false positives. To scan all rules, run `yara -r rules/04_beacons_c2.yar /path/to/samples`; YARA CLI takes a rule file and target, not a rules directory. `-r` traverses targets recursively. Use `-s` to print matched strings. Do not scan all of `/proc`, `/sys`, or `/dev` recursively.
 
-## Audit event integration
-Audit rules record events, but do **not** execute the collector. Build/configure a trusted audit dispatcher that parses complete event records, validates PID/paths, obtains the audit serial, and invokes `ir-collect.sh --scan PATH --pid PID --audit-serial SERIAL`. Do not execute untrusted audit record text in a shell. Some events (e.g. `init_module`) have no durable file path; `finit_module` may require file-descriptor-to-path correlation at event time. A process PID may be reused, and exited processes lose `/proc` data.
+For compressed `.ko.xz`/`.ko.zst`, decompress to a secure working directory before YARA; YARA cannot parse compressed ELF automatically. Do not execute suspicious files. Kernel module signing, package ownership, `modinfo`, `readelf`, and hashes must supplement rule matches.
 
-Example audit rules (adapt to your kernel and architecture):
-```text
--a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k kernel_module_activity
--a always,exit -F arch=b64 -S bpf -k bpf_activity
--w /etc/modules-load.d/ -p wa -k module_persistence
--w /etc/modprobe.d/ -p wa -k modprobe_change
+## C2 / beacon interpretation
+
+YARA matches **strings or bytes**, not observed outbound connections. A hard-coded IP or domain may be an indicator but cannot be assumed to be C2. Use `ss -tunap`, `journalctl`, DNS logs, firewall logs, packet capture, and parent-process information to corroborate. For suspicious PIDs: `ps -fp PID; readlink /proc/PID/exe; ls -l /proc/PID/fd; ss -tunap`. Repeated callback timing needs network telemetry; a string `sleep(` does not prove beaconing.
+
+## Auditd (separate from YARA)
+
+Review `auditd-watch.rules` and remove watches for paths that do not exist. Install it as `/etc/audit/rules.d/90-blue-team.rules`, then `sudo augenrules --load`. Verify with `sudo auditctl -l`; investigate with `sudo ausearch -k pam_change -i` or `sudo ausearch -k module_activity -i`. Rules collect only **future** activity and may produce substantial logs. They do not automatically launch a YARA scan or guarantee a live PID is still present. Add an event dispatcher later only after testing and validating inputs.
+
+## Existing collector
+
+The included `ir-collect.sh` is the original uploaded collector, unchanged. It defaults to `/etc/yara/linux_hunt.yar`, not these split files. To choose a rule explicitly:
+
+```bash
+sudo IR_RULES="$PWD/rules/01_lkm_rootkits.yar" bash ./ir-collect.sh --scan /path/to/suspicious.ko
 ```
-Apply using `sudo augenrules --load`. File watches require existing targets; directory watches do not automatically provide full historical contents.
 
-## Evidence and caveats
-Each match stores timestamps, hostname, rule snapshot and SHA-256, YARA version, raw matches, target SHA-256 (file scans), optional process PID/PPID/UID and executable hash, network snapshot, optional raw audit event, JSON summary, and manifest of evidence hashes. Hashes of collected files support later integrity checks but do not establish trusted chain of custody by themselves. Preserve the original artifact securely and forward evidence to a remote append-only log store where possible.
+It only creates a case on a match. Its network snapshot is **not proof of C2**. For a matchless incident, gather evidence separately. Preserve timestamps and originals; avoid `chmod 000` on live system dependencies.
 
-YARA rule names are heuristic categories, **not confirmed malware family names**. A jump opcode or eBPF helper name may be completely legitimate. Network snapshots are not proof of C2 or necessarily attributable to the alerted process. Static file YARA cannot establish that code has actually patched kernel memory. Auditd and `/proc` may be subverted after kernel compromise.
+## Limits and validation status
 
-The script and rules were syntax-checked for Bash, but YARA compilation and end-to-end runtime were not tested in this environment; validate with `yara -w ...` and a harmless sample on your target system before deployment.
-
-## Update 2026-11-17.2: web shells, beacons, memory hooks, endpoint evidence
-The rule file now contains ten independent rules. Web-shell rules look for request-controlled command execution; beacon heuristics combine networking, execution, and persistence indicators. Neither proves maliciousness. Generic jump patterns, especially `FF 25`, are common in legitimate software. A YARA hit does **not** prove an illegal memory write, an injected jump, or a confirmed C2 IP.
-
-The collector additionally captures `/proc/PID/maps` and `/proc/PID/smaps` (when readable) and lists **observed public endpoints** in `incident.json` as `unverified`. It cannot reliably associate all endpoints with the target PID, and `ss` is only a snapshot. Private/local addresses are excluded from that JSON endpoint list but retained in the raw network snapshot. IPs embedded in a sample are not extracted or classified by these rules; identifying true C2 requires independent network telemetry, reputation, and behavioral correlation.
-
-### Memory dump and integrity investigation
-`sudo yara -s linux_hunt.yar 1234` scans accessible process memory, not kernel memory and not a full dump. `sudo gcore -o /secure/incident-core 1234` can capture a user-process core (sensitive data; may pause process). Scan a core file using `yara -s linux_hunt.yar /secure/incident-core.1234`. Actual tamper detection requires trusted baseline comparison of mapped executable pages with relocation-aware handling, and corroborating telemetry (e.g. `mprotect`, `ptrace`, `process_vm_writev`, injected mappings). YARA does not compare trusted expected bytes with observed memory.
-
-### Validation
-Run `yara -w linux_hunt.yar /path/to/test` to compile and scan, or `yarac linux_hunt.yar compiled.yarc` to compile only (if installed). `yara --help`, `yara -s`, and `yara --version` show syntax, matched offsets, and engine version. Some installations use `yara64` instead of `yara`; check `command -v yara64`. `ir-collect.sh --help` documents the collector. Test against benign samples and tune false positives before enabling automatic alerts.
+The rules were authored for standard YARA 4.x syntax. YARA is not installed in the authoring environment, so **compilation and runtime matches have not been independently verified**. Run the `yarac` checks on your VM first. The ELF module may be unavailable in restricted builds. Legitimate security software can match hooking, eBPF, or network strings. Generic CR0/trampoline signatures are x86-64 only. No rule proves that kernel memory was patched, that a kworker name is fake, or that a module is trusted. Build module allowlists from verified packages and signed vendor inventories, not a `none of` YARA condition. Filesystem timestamps are not reliable proof of tampering without earlier audit/baseline records.

@@ -1,0 +1,15 @@
+# Auditd only records events; it does not run YARA or establish authorization.
+-w /etc/passwd -p wa -k identity_change
+-w /etc/group -p wa -k identity_change
+-w /etc/shadow -p wa -k identity_change
+-w /etc/sudoers.d/ -p wa -k sudo_change
+-w /etc/pam.d/ -p wa -k pam_change
+-w /etc/ssh/ -p wa -k ssh_change
+-w /etc/systemd/system/ -p wa -k systemd_change
+-w /etc/cron.d/ -p wa -k cron_change
+-w /etc/apt/apt.conf.d/ -p wa -k apt_hook_change
+-w /etc/modules-load.d/ -p wa -k module_persistence
+-w /etc/modprobe.d/ -p wa -k modprobe_change
+-w /etc/ld.so.preload -p wa -k loader_change
+-a always,exit -F arch=b64 -S init_module -S finit_module -S delete_module -k module_activity
+-a always,exit -F arch=b64 -S bpf -k bpf_activity
